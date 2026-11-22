@@ -1,0 +1,12 @@
+streamlit
+google-genai
+youtube-transcript-api
+langchain-core
+langchain-text-splitters
+langchain-chroma
+langchain-huggingface
+rank-bm25
+transformers
+torch
+numpy
+sentence-transformers

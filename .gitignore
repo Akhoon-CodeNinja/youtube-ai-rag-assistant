@@ -1,0 +1,15 @@
+venv/
+env/
+.venv/
+chroma_db/
+videos_metadata.json
+final_distilbert_model*/
+*.safetensors
+*.bin
+*.pt
+*.zip
+.env
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+prepare_github.py
