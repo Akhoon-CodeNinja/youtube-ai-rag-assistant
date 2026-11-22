@@ -20,7 +20,7 @@ st.set_page_config(page_title="AI Video Learning Suite", page_icon="🎓", layou
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 DB_DIR = "./chroma_db"
 METADATA_FILE = "videos_metadata.json"
-SQUAD_MODEL_PATH = "./final_distilbert_model-20261122T085358Z-1-001/final_distilbert_model"
+SQUAD_MODEL_PATH = "Dilawer-khan/distilbert-squad2-qa"
 DISTANCE_THRESHOLD = 1.12
 SQUAD_FAST_PATH_CONFIDENCE = 85.0  # Threshold (%) for zero-API-call local answers
 
@@ -47,8 +47,7 @@ def load_embedding_model():
 
 @st.cache_resource(show_spinner="Loading Local Fine-Tuned SQuAD 2.0 DistilBERT Verifier...")
 def load_squad_verifier():
-    if not os.path.exists(SQUAD_MODEL_PATH):
-        return None, None
+    pass
     qa_tokenizer = AutoTokenizer.from_pretrained(SQUAD_MODEL_PATH)
     qa_model = AutoModelForQuestionAnswering.from_pretrained(SQUAD_MODEL_PATH)
     qa_model.to("cpu")
