@@ -52,3 +52,8 @@ streamlit run app.py
    - **Q&A Assistant:** Ask factual or conceptual questions in English or Roman Urdu.
    - **Quiz Generator:** Generate and submit interactive MCQs based strictly on the video.
    - **Study Notes:** Generate and download structured `.md` revision notes.
+
+---
+
+## Model Training & Evaluation Notebook
+- The complete fine-tuning and SQuAD 2.0 evaluation pipeline (`EM`, `F1`, and `no_answer_probability` calibration) for `Dilawer-khan/distilbert-squad2-qa` is included in [`notebooks/distilbert_squad2_training_and_eval.ipynb`](notebooks/distilbert_squad2_training_and_eval.ipynb).
