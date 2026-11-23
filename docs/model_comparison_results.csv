@@ -1,0 +1,3 @@
+Model,Answerable EM (%),Answerable F1 (%),Impossible Acc (%),CPU Latency (ms),Disk Size (MB)
+distilbert-base-uncased (Selected),0.0,0.0,100.0,55.08,253.2
+albert-base-v2,50.61,62.6,81.75,105.66,44.5
