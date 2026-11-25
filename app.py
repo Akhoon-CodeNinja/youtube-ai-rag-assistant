@@ -1,9 +1,12 @@
-import streamlit as st
 import os
 import json
+import time
 import urllib.request
 import numpy as np
 import torch
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from google import genai
 from google.genai import types
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -14,50 +17,54 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from rank_bm25 import BM25Okapi
 from transformers import AutoTokenizer, AutoModelForQuestionAnswering
 
-# --- PAGE CONFIG ---
-st.set_page_config(page_title="AI Video Learning Suite", page_icon="🎓", layout="wide")
+app = FastAPI(title="AI Video Learning Suite API")
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+DEFAULT_GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 DB_DIR = "./chroma_db"
 METADATA_FILE = "videos_metadata.json"
 SQUAD_MODEL_PATH = "Dilawer-khan/distilbert-squad2-qa"
 DISTANCE_THRESHOLD = 1.12
-SQUAD_FAST_PATH_CONFIDENCE = 85.0  # Threshold (%) for zero-API-call local answers
+SQUAD_FAST_PATH_CONFIDENCE = 85.0
 
-# --- SESSION STATE ---
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "video_id" not in st.session_state:
-    st.session_state.video_id = None
-if "quiz_data" not in st.session_state:
-    st.session_state.quiz_data = None
-if "quiz_submitted" not in st.session_state:
-    st.session_state.quiz_submitted = False
-if "study_notes" not in st.session_state:
-    st.session_state.study_notes = None
+print("Starting AI Retrieval Engine (BGE-small)...")
+embeddings_model = HuggingFaceEmbeddings(
+    model_name="BAAI/bge-small-en-v1.5",
+    model_kwargs={"device": "cpu"},
+    encode_kwargs={"normalize_embeddings": True},
+)
 
-# --- CACHED MODELS ---
-@st.cache_resource(show_spinner="Starting AI Retrieval Engine...")
-def load_embedding_model():
-    return HuggingFaceEmbeddings(
-        model_name="BAAI/bge-small-en-v1.5",
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True}
-    )
+print("Loading Local Fine-Tuned SQuAD 2.0 DistilBERT Verifier...")
+qa_tokenizer = AutoTokenizer.from_pretrained(SQUAD_MODEL_PATH)
+qa_model = AutoModelForQuestionAnswering.from_pretrained(SQUAD_MODEL_PATH).to("cpu").eval()
+print("Backend Ready!")
 
-@st.cache_resource(show_spinner="Loading Local Fine-Tuned SQuAD 2.0 DistilBERT Verifier...")
-def load_squad_verifier():
-    pass
-    qa_tokenizer = AutoTokenizer.from_pretrained(SQUAD_MODEL_PATH)
-    qa_model = AutoModelForQuestionAnswering.from_pretrained(SQUAD_MODEL_PATH)
-    qa_model.to("cpu")
-    qa_model.eval()
-    return qa_tokenizer, qa_model
 
-embeddings_model = load_embedding_model()
-qa_tokenizer, qa_model = load_squad_verifier()
+class IndexRequest(BaseModel):
+    url: str
+    api_key: str = ""
 
-# --- METADATA & YOUTUBE HELPERS ---
+
+class AskRequest(BaseModel):
+    video_id: str
+    question: str
+    api_key: str = ""
+
+
+class GenerateRequest(BaseModel):
+    video_id: str
+    language: str = "English"
+    num_questions: int = 5
+    api_key: str = ""
+
+
 def load_video_metadata():
     if os.path.exists(METADATA_FILE):
         try:
@@ -67,11 +74,13 @@ def load_video_metadata():
             return {}
     return {}
 
+
 def save_video_metadata(video_id, title):
     data = load_video_metadata()
     data[video_id] = title
     with open(METADATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
 
 def fetch_youtube_title(video_id):
     try:
@@ -83,6 +92,7 @@ def fetch_youtube_title(video_id):
     except Exception:
         return f"Video ({video_id})"
 
+
 def extract_video_id(url):
     if "v=" in url:
         return url.split("v=")[1].split("&")[0]
@@ -90,7 +100,16 @@ def extract_video_id(url):
         return url.split("youtu.be/")[1].split("?")[0]
     return None
 
-# --- BILINGUAL HELPERS ---
+
+def get_db(video_id):
+    collection_name = f"vid_{video_id.replace('-', '_')}"
+    return Chroma(
+        collection_name=collection_name,
+        embedding_function=embeddings_model,
+        persist_directory=DB_DIR,
+    )
+
+
 def is_roman_urdu(text):
     roman_urdu_markers = {
         "kya", "kia", "kyun", "kese", "kaise", "hai", "hain", "tha", "thi",
@@ -101,19 +120,22 @@ def is_roman_urdu(text):
     words = {w.lower().strip("?.!,") for w in text.split()}
     return len(words.intersection(roman_urdu_markers)) >= 1
 
-def fast_translate_to_english(roman_text):
-    client = genai.Client(api_key=GEMINI_API_KEY, http_options={"timeout": 20000})
+
+def fast_translate_to_english(roman_text, api_key):
+    if not api_key:
+        return roman_text
+    client = genai.Client(api_key=api_key, http_options={"timeout": 20000})
     prompt = (
         "Translate the following Roman Urdu question into clear, natural English. "
         "Return ONLY the English translation and nothing else.\n\n"
         f"Roman Urdu: {roman_text}"
     )
-    for model_name in ["gemini-3.5-flash-lite", "gemini-3.8-flash"]:
+    for model_name in ["gemini-2.5-flash", "gemini-2.0-flash"]:
         try:
             res = client.models.generate_content(
                 model=model_name,
                 contents=prompt,
-                config=types.GenerateContentConfig(temperature=0.0)
+                config=types.GenerateContentConfig(temperature=0.0),
             )
             if res and res.text:
                 return res.text.strip()
@@ -121,9 +143,12 @@ def fast_translate_to_english(roman_text):
             continue
     return roman_text
 
-# --- HIERARCHICAL INDEXING ---
-def generate_chapter_headings(sections):
-    client = genai.Client(api_key=GEMINI_API_KEY, http_options={"timeout": 45000})
+
+def generate_chapter_headings(sections, api_key):
+    if not api_key:
+        return {str(i): f"Section {i + 1} ({int(s['start'])}s - {int(s['end'])}s)" for i, s in enumerate(sections)}
+
+    client = genai.Client(api_key=api_key, http_options={"timeout": 45000})
     section_summaries = []
     for idx, sec in enumerate(sections):
         preview = sec["text"][:1500]
@@ -137,27 +162,25 @@ def generate_chapter_headings(sections):
         + "\n\n---\n\n".join(section_summaries)
     )
 
-    try:
-        for model_name in ["gemini-3.5-flash-lite", "gemini-3.8-flash"]:
-            try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.0,
-                        response_mime_type="application/json"
-                    )
-                )
-                if response and response.text:
-                    return json.loads(response.text)
-            except Exception:
-                continue
-    except Exception:
-        pass
+    for model_name in ["gemini-2.5-flash", "gemini-2.0-flash"]:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    response_mime_type="application/json",
+                ),
+            )
+            if response and response.text:
+                return json.loads(response.text)
+        except Exception:
+            continue
 
     return {str(i): f"Section {i + 1} ({int(s['start'])}s - {int(s['end'])}s)" for i, s in enumerate(sections)}
 
-def build_hierarchical_chunks(transcript):
+
+def build_hierarchical_chunks(transcript, api_key):
     full_text = ""
     char_to_time = []
 
@@ -183,8 +206,7 @@ def build_hierarchical_chunks(transcript):
         s_end = total_len if i == num_sections - 1 else (i + 1) * section_size
         sec_text = full_text[s_start:s_end].strip()
 
-        t_start = 0
-        t_end = 0
+        t_start, t_end = 0, 0
         for c_idx, ts in char_to_time:
             if c_idx <= s_start:
                 t_start = ts
@@ -193,12 +215,12 @@ def build_hierarchical_chunks(transcript):
 
         sections.append({"start": t_start, "end": t_end, "text": sec_text, "char_start": s_start, "char_end": s_end})
 
-    headings_map = generate_chapter_headings(sections)
+    headings_map = generate_chapter_headings(sections, api_key)
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=500,
         chunk_overlap=100,
-        separators=[". ", "? ", "! ", " ", ""]
+        separators=[". ", "? ", "! ", " ", ""],
     )
     chunks = splitter.split_text(full_text)
 
@@ -228,13 +250,13 @@ def build_hierarchical_chunks(transcript):
         documents.append(
             Document(
                 page_content=contextualized_content,
-                metadata={"start_time": chunk_time, "chapter": chapter_heading}
+                metadata={"start_time": chunk_time, "chapter": chapter_heading},
             )
         )
 
     return documents
 
-# --- HYBRID RETRIEVAL + SQUAD 2.0 LOCAL FAST-PATH VERIFIER ---
+
 def hierarchical_hybrid_retrieve(db, query, k=4):
     all_records = db.get()
     all_texts = all_records.get("documents", [])
@@ -296,10 +318,9 @@ def hierarchical_hybrid_retrieve(db, query, k=4):
 
     return final_docs, best_dense_score
 
-def verify_with_squad_distilbert(question, context_chunks):
-    if qa_tokenizer is None or qa_model is None:
-        return None
 
+def verify_with_squad_distilbert(question, context_chunks):
+    t0 = time.perf_counter()
     best_overall_span = ""
     best_quote_sentence = ""
     best_timestamp = 0
@@ -314,7 +335,7 @@ def verify_with_squad_distilbert(question, context_chunks):
             clean_context,
             max_length=384,
             truncation="only_second",
-            return_offsets_mapping=True
+            return_offsets_mapping=True,
         )
         sequence_ids = inputs.sequence_ids()
         offsets = inputs["offset_mapping"]
@@ -358,24 +379,25 @@ def verify_with_squad_distilbert(question, context_chunks):
             best_overall_span = best_answer
             best_timestamp = int(doc.metadata.get("start_time", 0))
 
-            # Extract surrounding sentence for UI proof highlight
             c_start, c_end = best_char_range
             sent_start = max(0, clean_context.rfind(".", 0, c_start) + 1)
             sent_end = clean_context.find(".", c_end)
             if sent_end == -1:
                 sent_end = len(clean_context)
             raw_sentence = clean_context[sent_start:sent_end].strip()
-            best_quote_sentence = raw_sentence.replace(best_answer, f"**{best_answer}**", 1)
+            best_quote_sentence = raw_sentence
 
+    latency_ms = round((time.perf_counter() - t0) * 1000, 2)
     return {
         "extracted_span": best_overall_span,
         "highlighted_quote": best_quote_sentence,
         "timestamp": best_timestamp,
         "no_answer_probability": round(lowest_no_ans_prob, 4),
-        "answerable_confidence": round((1.0 - lowest_no_ans_prob) * 100, 1)
+        "answerable_confidence": round((1.0 - lowest_no_ans_prob) * 100, 1),
+        "latency_ms": latency_ms,
     }
 
-# --- QUIZ & STUDY NOTES GENERATORS ---
+
 def get_full_clean_transcript(db):
     records = db.get()
     docs = records.get("documents", [])
@@ -398,110 +420,41 @@ def get_full_clean_transcript(db):
         else:
             formatted_sections.append(clean_body)
 
-    full_compiled = " ".join(formatted_sections)
-    return full_compiled[:18000]  # Safe window for fast generation
+    return " ".join(formatted_sections)[:18000]
 
-def generate_video_quiz(db, num_questions=5, language="English"):
-    transcript_text = get_full_clean_transcript(db)
-    if not transcript_text:
-        return None
 
-    client = genai.Client(api_key=GEMINI_API_KEY, http_options={"timeout": 45000})
-    lang_directive = (
-        "Write all questions, options, and explanations in clear Roman Urdu (Urdu written in English alphabets)."
-        if language == "Roman Urdu" else
-        "Write all questions, options, and explanations in clear English."
-    )
+@app.get("/api/health")
+def health():
+    return {"status": "online", "saved_videos": load_video_metadata()}
 
-    prompt = (
-        f"You are an academic exam creator. Based ONLY on the following YouTube video transcript, "
-        f"create {num_questions} multiple-choice questions (MCQs) that test key facts and concepts explicitly stated in the video. "
-        f"Do NOT include outside facts. {lang_directive}\n\n"
-        "Return ONLY a valid JSON array where each element has this exact schema:\n"
-        '[{"question": "...", "options": ["Option A", "Option B", "Option C", "Option D"], "answer": "Exact matching string from options", "explanation": "Brief explanation referencing the video"}]\n\n'
-        f"Transcript:\n{transcript_text}"
-    )
 
-    for model_name in ["gemini-3.5-flash-lite", "gemini-3.8-flash"]:
-        try:
-            res = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.2,
-                    response_mime_type="application/json"
-                )
-            )
-            if res and res.text:
-                return json.loads(res.text)
-        except Exception:
-            continue
-    return None
+@app.get("/api/videos")
+def list_videos():
+    return {"videos": load_video_metadata()}
 
-def generate_video_study_notes(db, video_title, language="English"):
-    transcript_text = get_full_clean_transcript(db)
-    if not transcript_text:
-        return None
 
-    client = genai.Client(api_key=GEMINI_API_KEY, http_options={"timeout": 45000})
-    lang_directive = (
-        "Write the study notes in clear, structured Roman Urdu (Urdu written in English alphabets), keeping technical terms in English."
-        if language == "Roman Urdu" else
-        "Write the study notes in clear, structured English."
-    )
+@app.post("/api/process")
+def process_video(req: IndexRequest):
+    api_key = req.api_key or DEFAULT_GEMINI_KEY
+    video_id = extract_video_id(req.url)
+    if not video_id:
+        raise HTTPException(status_code=400, detail="Invalid YouTube URL.")
 
-    prompt = (
-        f"Create comprehensive, well-structured Study Notes for the YouTube video titled '{video_title}' "
-        f"using ONLY the provided transcript. Do NOT add outside information. {lang_directive}\n\n"
-        "Format the notes cleanly in Markdown with:\n"
-        "1. **Executive Overview** (2-3 sentences)\n"
-        "2. **Topic-by-Topic Breakdown** (organized chronologically with timestamps)\n"
-        "3. **Key Definitions, Formulas & Numbers** (bulleted list)\n"
-        "4. **Quick Revision Takeaways** (3-5 bullet points)\n\n"
-        f"Transcript:\n{transcript_text}"
-    )
+    db = get_db(video_id)
+    existing = db.get()
+    saved_meta = load_video_metadata()
 
-    for model_name in ["gemini-3.5-flash-lite", "gemini-3.8-flash"]:
-        try:
-            res = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(temperature=0.1)
-            )
-            if res and res.text:
-                return res.text.strip()
-        except Exception:
-            continue
-    return None
+    if existing["ids"]:
+        title = saved_meta.get(video_id) or fetch_youtube_title(video_id)
+        save_video_metadata(video_id, title)
+        return {
+            "video_id": video_id,
+            "title": title,
+            "chunks": len(existing["ids"]),
+            "status": "cached",
+        }
 
-# --- VIDEO INDEXING ---
-def process_video(video_url):
     try:
-        video_id = extract_video_id(video_url)
-        if not video_id:
-            st.error("Invalid YouTube URL. Please enter a valid link.")
-            return False
-
-        collection_name = f"vid_{video_id.replace('-', '_')}"
-        db = Chroma(
-            collection_name=collection_name,
-            embedding_function=embeddings_model,
-            persist_directory=DB_DIR
-        )
-
-        existing_data = db.get()
-        if existing_data["ids"]:
-            saved_meta = load_video_metadata()
-            if video_id not in saved_meta:
-                save_video_metadata(video_id, fetch_youtube_title(video_id))
-            st.session_state.video_id = video_id
-            st.session_state.collection_name = collection_name
-            st.session_state.messages = []
-            st.session_state.quiz_data = None
-            st.session_state.quiz_submitted = False
-            st.session_state.study_notes = None
-            return "cached"
-
         api = YouTubeTranscriptApi()
         transcript_list = api.list(video_id)
         try:
@@ -510,326 +463,219 @@ def process_video(video_url):
             first_available = next(iter(transcript_list))
             transcript = first_available.fetch()
 
-        documents = build_hierarchical_chunks(transcript)
+        documents = build_hierarchical_chunks(transcript, api_key)
+        if not documents:
+            raise HTTPException(status_code=400, detail="Transcript was empty.")
         db.add_documents(documents)
 
-        save_video_metadata(video_id, fetch_youtube_title(video_id))
-        st.session_state.video_id = video_id
-        st.session_state.collection_name = collection_name
-        st.session_state.messages = []
-        st.session_state.quiz_data = None
-        st.session_state.quiz_submitted = False
-        st.session_state.study_notes = None
-        return "processed"
+        title = fetch_youtube_title(video_id)
+        save_video_metadata(video_id, title)
+        return {
+            "video_id": video_id,
+            "title": title,
+            "chunks": len(documents),
+            "status": "processed",
+        }
+    except HTTPException:
+        raise
     except Exception as e:
-        st.error(f"Error processing video: {e}")
-        return False
+        raise HTTPException(status_code=400, detail=f"Transcript error: {str(e)}")
 
-# --- UI LAYOUT ---
-st.title("🎓 AI Video Learning Suite (Zero-Hallucination RAG + SQuAD 2.0)")
 
-with st.sidebar:
-    st.header("🔑 API Key")
-    user_api_key = st.text_input("Enter Gemini API Key:", value=GEMINI_API_KEY, type="password")
-    if user_api_key:
-        GEMINI_API_KEY = user_api_key
-    st.divider()
-    st.header("⚙️ Video Setup")
-    video_url = st.text_input("🔗 YouTube Video URL:")
-    if st.button("Process Video", use_container_width=True):
-        if video_url:
-            with st.spinner("Generating Chapter Headings & Indexing Video..."):
-                status = process_video(video_url)
-                if status == "cached":
-                    st.success("⚡ Loaded from isolated database (0.1s)!")
-                elif status == "processed":
-                    st.success("✅ Video indexed with Chapter Headings!")
-        else:
-            st.warning("Please enter a YouTube URL.")
+@app.post("/api/ask")
+def ask_video(req: AskRequest):
+    api_key = req.api_key or DEFAULT_GEMINI_KEY
+    db = get_db(req.video_id)
+    if not db.get()["ids"]:
+        raise HTTPException(status_code=404, detail="Video not indexed in ChromaDB.")
 
-    st.divider()
-    st.header("📚 Saved Video Databases")
-    saved_videos = load_video_metadata()
-    if saved_videos:
-        video_options = {f"{title} [{vid}]": vid for vid, title in saved_videos.items()}
-        selected_label = st.selectbox(
-            "Switch to a processed video:",
-            options=list(video_options.keys()),
-            key="saved_video_selector"
+    roman_mode = is_roman_urdu(req.question)
+    english_query = fast_translate_to_english(req.question, api_key) if roman_mode else req.question
+
+    valid_chunks, best_score = hierarchical_hybrid_retrieve(db, english_query, k=4)
+    if not valid_chunks:
+        refusal = (
+            "Is video mein is topic ka zikar nahi hai."
+            if roman_mode
+            else "This topic is not mentioned in the video."
         )
-        if st.button("Load Selected Video", use_container_width=True):
-            chosen_id = video_options[selected_label]
-            if st.session_state.video_id != chosen_id:
-                st.session_state.video_id = chosen_id
-                st.session_state.collection_name = f"vid_{chosen_id.replace('-', '_')}"
-                st.session_state.messages = []
-                st.session_state.quiz_data = None
-                st.session_state.quiz_submitted = False
-                st.session_state.study_notes = None
-                st.rerun()
-    else:
-        st.caption("No processed videos saved yet.")
+        return {
+            "answer": refusal,
+            "verified": False,
+            "confidence": 0.0,
+            "latency_ms": 0.0,
+            "quote": None,
+            "timestamp": 0,
+            "mode": "Guardrail Blocked",
+        }
 
-if st.session_state.video_id:
-    current_title = load_video_metadata().get(st.session_state.video_id, st.session_state.video_id)
-    db = Chroma(
-        collection_name=st.session_state.collection_name,
-        embedding_function=embeddings_model,
-        persist_directory=DB_DIR
+    squad_result = verify_with_squad_distilbert(english_query, valid_chunks)
+    combined_context = "\n---\n".join(
+        f"[Time: {int(d.metadata.get('start_time', 0))}s] {d.page_content}"
+        for d in valid_chunks
+    )
+    start_seconds = (
+        squad_result["timestamp"]
+        if squad_result["timestamp"] > 0
+        else int(valid_chunks[0].metadata.get("start_time", 0))
     )
 
-    col1, col2 = st.columns([1, 1.15])
+    use_local_fast_path = (
+        not roman_mode
+        and squad_result["answerable_confidence"] >= SQUAD_FAST_PATH_CONFIDENCE
+        and len(squad_result["extracted_span"]) > 0
+    )
 
-    with col1:
-        st.subheader("📺 Video Player")
-        st.video(f"https://www.youtube.com/watch?v={st.session_state.video_id}")
-        st.caption(f"**Active Video:** {current_title}")
+    if use_local_fast_path or not api_key:
+        if squad_result["no_answer_probability"] >= 0.65:
+            return {
+                "answer": "This topic is not mentioned in the video." if not roman_mode else "Is video mein is topic ka zikar nahi hai.",
+                "verified": False,
+                "confidence": squad_result["answerable_confidence"],
+                "latency_ms": squad_result["latency_ms"],
+                "quote": None,
+                "timestamp": start_seconds,
+                "mode": "Local SQuAD 2.0",
+            }
+        return {
+            "answer": squad_result["extracted_span"],
+            "verified": True,
+            "confidence": squad_result["answerable_confidence"],
+            "latency_ms": squad_result["latency_ms"],
+            "quote": squad_result["highlighted_quote"],
+            "timestamp": start_seconds,
+            "mode": "Local Fast-Path (0 API Tokens)",
+        }
 
-    with col2:
-        tab_chat, tab_quiz, tab_notes = st.tabs(["💬 Q&A Assistant", "📝 Quiz Generator", "📒 Study Notes"])
+    client = genai.Client(api_key=api_key, http_options={"timeout": 45000})
+    target_lang_rule = (
+        "Respond in clear, natural Roman Urdu (Urdu written in English alphabets). "
+        "If the answer is not in the excerpts, reply ONLY with: 'Is video mein is topic ka zikar nahi hai.'"
+        if roman_mode
+        else "Respond in clear, concise English. "
+        "If the answer is not in the excerpts, reply ONLY with: 'This topic is not mentioned in the video.'"
+    )
+    system_instruction = (
+        "You are a strict fact-extraction assistant. Answer the user's question using ONLY "
+        "the provided YouTube transcript excerpts. Do NOT use outside knowledge or invent facts. "
+        + target_lang_rule
+    )
+    squad_hint = ""
+    if squad_result["no_answer_probability"] < 0.65 and squad_result["extracted_span"]:
+        squad_hint = f"\n\nVerified Extractive Span: {squad_result['extracted_span']}"
 
-        # === TAB 1: ZERO-HALLUCINATION CHAT + LOCAL FAST PATH ===
-        with tab_chat:
-            for message in st.session_state.messages:
-                with st.chat_message(message["role"]):
-                    st.markdown(message["content"])
-                    if message.get("quote"):
-                        st.info(f"📌 **Transcript Proof:** \"{message['quote']}\"")
-                    if message.get("timestamp_url"):
-                        st.markdown(f"⏱ **[Click to Watch from {message['time_sec']}s]({message['timestamp_url']})**")
+    user_message = f"Transcript Excerpts:\n{combined_context}{squad_hint}\n\nQuestion: {english_query}"
 
-            if prompt := st.chat_input("Ask in English or Roman Urdu..."):
-                with st.chat_message("user"):
-                    st.markdown(prompt)
-                st.session_state.messages.append({"role": "user", "content": prompt})
-
-                with st.chat_message("assistant"):
-                    with st.spinner("Searching Chapters & Running Local SQuAD 2.0 Verification..."):
-                        roman_mode = is_roman_urdu(prompt)
-                        english_query = prompt
-
-                        if roman_mode:
-                            english_query = fast_translate_to_english(prompt)
-                            st.caption(f"🌐 **Translated Query (EN):** {english_query}")
-
-                        valid_chunks, best_score = hierarchical_hybrid_retrieve(db, english_query, k=4)
-
-                        if not valid_chunks:
-                            refusal = (
-                                "Is video mein is topic ka zikar nahi hai."
-                                if roman_mode else
-                                "This topic is not mentioned in the video."
-                            )
-                            st.markdown(refusal)
-                            with st.expander("🔍 Guardrail Triggered (Blocked Before Model)"):
-                                st.write(f"**Best Normalized Distance:** {round(best_score, 4)} (Threshold: {DISTANCE_THRESHOLD})")
-                            st.session_state.messages.append({"role": "assistant", "content": refusal})
-                        else:
-                            squad_result = verify_with_squad_distilbert(english_query, valid_chunks)
-                            combined_context = "\n---\n".join([
-                                f"[Time: {int(d.metadata.get('start_time', 0))}s] {d.page_content}"
-                                for d in valid_chunks
-                            ])
-
-                            start_seconds = (
-                                squad_result["timestamp"]
-                                if (squad_result and squad_result["timestamp"] > 0)
-                                else int(valid_chunks[0].metadata.get("start_time", 0))
-                            )
-                            jump_url = f"https://www.youtube.com/watch?v={st.session_state.video_id}&t={start_seconds}s"
-
-                            with st.expander("🔍 Retrieval + Local DistilBERT SQuAD 2.0 Verification"):
-                                st.write(f"**Best Normalized Distance:** {round(best_score, 4)} (Threshold: {DISTANCE_THRESHOLD})")
-                                if squad_result:
-                                    st.write(
-                                        f"**SQuAD 2.0 Extracted Span:** `{squad_result['extracted_span']}` | "
-                                        f"**Confidence:** {squad_result['answerable_confidence']}% | "
-                                        f"**No-Answer Prob:** {squad_result['no_answer_probability']}"
-                                    )
-                                st.text(combined_context)
-
-                            # ZERO-API-CALL LOCAL FAST PATH (English factual queries with >= 85% DistilBERT confidence)
-                            use_local_fast_path = (
-                                not roman_mode
-                                and squad_result is not None
-                                and squad_result["answerable_confidence"] >= SQUAD_FAST_PATH_CONFIDENCE
-                                and len(squad_result["extracted_span"]) > 0
-                            )
-
-                            if use_local_fast_path:
-                                ai_reply = f"⚡ **Verified Answer (Local SQuAD 2.0 — 0 API Tokens):** {squad_result['extracted_span']}"
-                                quote_text = squad_result["highlighted_quote"]
-                                st.markdown(ai_reply)
-                                if quote_text:
-                                    st.info(f"📌 **Transcript Proof:** \"{quote_text}\"")
-                                st.markdown(f"⏱ **[Click to Watch from {start_seconds}s]({jump_url})**")
-
-                                st.session_state.messages.append({
-                                    "role": "assistant",
-                                    "content": ai_reply,
-                                    "quote": quote_text,
-                                    "timestamp_url": jump_url,
-                                    "time_sec": start_seconds
-                                })
-                            else:
-                                # CONCEPTUAL SYNTHESIS & BILINGUAL GENERATION VIA GEMINI
-                                client = genai.Client(api_key=GEMINI_API_KEY, http_options={"timeout": 45000})
-                                target_lang_rule = (
-                                    "Respond in clear, natural Roman Urdu (Urdu written in English alphabets). "
-                                    "If the answer is not in the excerpts, reply ONLY with: 'Is video mein is topic ka zikar nahi hai.'"
-                                    if roman_mode else
-                                    "Respond in clear, concise English. "
-                                    "If the answer is not in the excerpts, reply ONLY with: 'This topic is not mentioned in the video.'"
-                                )
-
-                                system_instruction = (
-                                    "You are a strict fact-extraction assistant. Answer the user's question using ONLY "
-                                    "the provided YouTube transcript excerpts. Do NOT use outside knowledge or invent facts. "
-                                    "Synthesize relevant details explicitly stated in the excerpts to answer clearly. "
-                                    + target_lang_rule
-                                )
-
-                                squad_hint = ""
-                                if squad_result and squad_result["no_answer_probability"] < 0.65 and squad_result["extracted_span"]:
-                                    squad_hint = f"\n\nVerified Extractive Span (Local DistilBERT SQuAD 2.0): {squad_result['extracted_span']}"
-
-                                user_message = f"Transcript Excerpts:\n{combined_context}{squad_hint}\n\nQuestion: {english_query}"
-
-                                try:
-                                    response = None
-                                    last_err = None
-                                    for model_name in ["gemini-3.5-flash-lite", "gemini-3.8-flash"]:
-                                        try:
-                                            response = client.models.generate_content(
-                                                model=model_name,
-                                                contents=user_message,
-                                                config=types.GenerateContentConfig(
-                                                    system_instruction=system_instruction,
-                                                    temperature=0.0,
-                                                )
-                                            )
-                                            if response and response.text:
-                                                break
-                                        except Exception as inner_e:
-                                            last_err = inner_e
-                                            continue
-
-                                    if response is None:
-                                        raise last_err
-
-                                    ai_reply = response.text.strip()
-                                    is_refusal = (
-                                        "not mentioned in the video" in ai_reply.lower()
-                                        or "zikar nahi hai" in ai_reply.lower()
-                                    )
-                                    quote_text = (
-                                        squad_result["highlighted_quote"]
-                                        if (not is_refusal and squad_result and squad_result["no_answer_probability"] < 0.65)
-                                        else None
-                                    )
-
-                                    st.markdown(ai_reply)
-                                    if quote_text:
-                                        st.info(f"📌 **Transcript Proof:** \"{quote_text}\"")
-                                    if not is_refusal:
-                                        st.markdown(f"⏱ **[Click to Watch from {start_seconds}s]({jump_url})**")
-
-                                    st.session_state.messages.append({
-                                        "role": "assistant",
-                                        "content": ai_reply,
-                                        "quote": quote_text,
-                                        "timestamp_url": None if is_refusal else jump_url,
-                                        "time_sec": start_seconds
-                                    })
-
-                                except Exception as e:
-                                    error_msg = str(e)
-                                    if "503" in error_msg or "504" in error_msg or "UNAVAILABLE" in error_msg or "DEADLINE_EXCEEDED" in error_msg:
-                                        st.warning("⚠️ Google AI server is temporarily busy. Please try again in a moment.")
-                                    else:
-                                        st.error(f"❌ Error: {error_msg}")
-
-        # === TAB 2: INTERACTIVE QUIZ GENERATOR ===
-        with tab_quiz:
-            st.subheader("📝 Interactive Video Quiz")
-            q_col1, q_col2, q_col3 = st.columns([1, 1, 1])
-            with q_col1:
-                num_q = st.selectbox("Number of Questions:", [5, 10], index=0)
-            with q_col2:
-                quiz_lang = st.selectbox("Quiz Language:", ["English", "Roman Urdu"], index=0)
-            with q_col3:
-                st.write("")
-                st.write("")
-                gen_quiz_btn = st.button("🎯 Generate Quiz", use_container_width=True)
-
-            if gen_quiz_btn:
-                with st.spinner("Creating video-grounded MCQs..."):
-                    quiz_items = generate_video_quiz(db, num_questions=num_q, language=quiz_lang)
-                    if quiz_items:
-                        st.session_state.quiz_data = quiz_items
-                        st.session_state.quiz_submitted = False
-                    else:
-                        st.error("Could not generate quiz. Please try again.")
-
-            if st.session_state.quiz_data:
-                with st.form("video_quiz_form"):
-                    user_answers = {}
-                    for idx, item in enumerate(st.session_state.quiz_data):
-                        st.markdown(f"**Q{idx + 1}. {item['question']}**")
-                        user_answers[idx] = st.radio(
-                            f"Select answer for Q{idx + 1}:",
-                            options=item["options"],
-                            key=f"quiz_q_{st.session_state.video_id}_{idx}",
-                            label_visibility="collapsed"
-                        )
-                        st.write("")
-
-                    submitted = st.form_submit_button("✅ Submit Quiz & Check Score")
-                    if submitted:
-                        st.session_state.quiz_submitted = True
-
-                if st.session_state.quiz_submitted:
-                    score = 0
-                    total = len(st.session_state.quiz_data)
-                    st.divider()
-                    for idx, item in enumerate(st.session_state.quiz_data):
-                        chosen = user_answers.get(idx)
-                        correct = item["answer"]
-                        if chosen == correct:
-                            score += 1
-                            st.success(f"**Q{idx + 1}: Correct!** ({correct}) — {item['explanation']}")
-                        else:
-                            st.error(f"**Q{idx + 1}: Incorrect.** Your answer: *{chosen}* | Correct: **{correct}** — {item['explanation']}")
-
-                    st.metric(label="🏆 Final Quiz Score", value=f"{score} / {total} ({int((score/total)*100)}%)")
-
-        # === TAB 3: STRUCTURED STUDY NOTES GENERATOR ===
-        with tab_notes:
-            st.subheader("📒 Structured Study Notes")
-            n_col1, n_col2 = st.columns([1, 1])
-            with n_col1:
-                notes_lang = st.selectbox("Notes Language:", ["English", "Roman Urdu"], index=0)
-            with n_col2:
-                st.write("")
-                st.write("")
-                gen_notes_btn = st.button("✨ Generate Study Notes", use_container_width=True)
-
-            if gen_notes_btn:
-                with st.spinner("Compiling structured study notes from video chapters..."):
-                    notes_md = generate_video_study_notes(db, current_title, language=notes_lang)
-                    if notes_md:
-                        st.session_state.study_notes = notes_md
-                    else:
-                        st.error("Could not generate notes. Please try again.")
-
-            if st.session_state.study_notes:
-                st.download_button(
-                    label="📥 Download Notes (.md)",
-                    data=st.session_state.study_notes,
-                    file_name=f"{st.session_state.video_id}_study_notes.md",
-                    mime="text/markdown"
+    for model_name in ["gemini-2.5-flash", "gemini-2.0-flash"]:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=user_message,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    temperature=0.0,
+                ),
+            )
+            if response and response.text:
+                ai_reply = response.text.strip()
+                is_refusal = (
+                    "not mentioned in the video" in ai_reply.lower()
+                    or "zikar nahi hai" in ai_reply.lower()
                 )
-                st.divider()
-                st.markdown(st.session_state.study_notes)
-else:
-    st.info("👈 Paste any YouTube URL in the sidebar and click 'Process Video' to unlock Q&A, Quiz, and Study Notes.")
+                return {
+                    "answer": ai_reply,
+                    "verified": not is_refusal,
+                    "confidence": squad_result["answerable_confidence"],
+                    "latency_ms": squad_result["latency_ms"],
+                    "quote": None if is_refusal else squad_result["highlighted_quote"],
+                    "timestamp": start_seconds,
+                    "mode": "Hybrid RAG + Gemini",
+                }
+        except Exception:
+            continue
+
+    raise HTTPException(status_code=503, detail="Gemini API unavailable. Check API key or try again.")
+
+
+@app.post("/api/notes")
+def generate_notes(req: GenerateRequest):
+    api_key = req.api_key or DEFAULT_GEMINI_KEY
+    if not api_key:
+        raise HTTPException(status_code=400, detail="Gemini API key required for Study Notes.")
+
+    db = get_db(req.video_id)
+    transcript_text = get_full_clean_transcript(db)
+    if not transcript_text:
+        raise HTTPException(status_code=404, detail="Transcript not found.")
+
+    title = load_video_metadata().get(req.video_id, req.video_id)
+    lang_directive = (
+        "Write the study notes in clear, structured Roman Urdu (Urdu written in English alphabets), keeping technical terms in English."
+        if req.language == "Roman Urdu"
+        else "Write the study notes in clear, structured English."
+    )
+    prompt = (
+        f"Create comprehensive, well-structured Study Notes for the YouTube video titled '{title}' "
+        f"using ONLY the provided transcript. Do NOT add outside information. {lang_directive}\n\n"
+        "Format cleanly in Markdown with Executive Overview, Topic-by-Topic Breakdown with timestamps, "
+        "Key Definitions/Numbers, and Quick Revision Takeaways.\n\n"
+        f"Transcript:\n{transcript_text}"
+    )
+
+    client = genai.Client(api_key=api_key, http_options={"timeout": 45000})
+    for model_name in ["gemini-2.5-flash", "gemini-2.0-flash"]:
+        try:
+            res = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0.1),
+            )
+            if res and res.text:
+                return {"notes": res.text.strip()}
+        except Exception:
+            continue
+
+    raise HTTPException(status_code=503, detail="Could not generate study notes.")
+
+
+@app.post("/api/quiz")
+def generate_quiz(req: GenerateRequest):
+    api_key = req.api_key or DEFAULT_GEMINI_KEY
+    if not api_key:
+        raise HTTPException(status_code=400, detail="Gemini API key required for Quiz.")
+
+    db = get_db(req.video_id)
+    transcript_text = get_full_clean_transcript(db)
+    if not transcript_text:
+        raise HTTPException(status_code=404, detail="Transcript not found.")
+
+    lang_directive = (
+        "Write all questions, options, and explanations in clear Roman Urdu (Urdu written in English alphabets)."
+        if req.language == "Roman Urdu"
+        else "Write all questions, options, and explanations in clear English."
+    )
+    prompt = (
+        f"Based ONLY on the following YouTube video transcript, create {req.num_questions} multiple-choice questions (MCQs). "
+        f"{lang_directive}\n\n"
+        "Return ONLY a valid JSON array:\n"
+        '[{"question": "...", "options": ["A", "B", "C", "D"], "answer": "Exact option text", "explanation": "..."}]\n\n'
+        f"Transcript:\n{transcript_text}"
+    )
+
+    client = genai.Client(api_key=api_key, http_options={"timeout": 45000})
+    for model_name in ["gemini-2.5-flash", "gemini-2.0-flash"]:
+        try:
+            res = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.2,
+                    response_mime_type="application/json",
+                ),
+            )
+            if res and res.text:
+                return {"quiz": json.loads(res.text)}
+        except Exception:
+            continue
+
+    raise HTTPException(status_code=503, detail="Could not generate quiz.")

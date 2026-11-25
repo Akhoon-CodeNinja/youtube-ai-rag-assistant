@@ -13,3 +13,6 @@ final_distilbert_model*/
 __pycache__/
 *.pyc
 prepare_github.py
+gemini_keys.json 
+gemini_keys.json
+frontend/node_modules/
